@@ -1,0 +1,659 @@
+#!/bin/bash
+set -e
+
+echo "=================================================================="
+echo " 🚀 Установка интерактивного комплекса WebUI (~15 МБ RAM)"
+echo "=================================================================="
+
+apt-get update -y -qq && apt-get install -y -qq python3 curl openssl
+
+# 1. Извлечение оригинального интерфейса Open WebUI (если еще не установлен)
+if [ ! -f /var/www/open-webui/index.html ]; then
+    echo "📦 Извлечение оригинального интерфейса Open WebUI..."
+    apt-get install -y -qq docker.io
+    systemctl start docker
+    docker rm -f temp-webui 2>/dev/null || true
+    docker create --name temp-webui ghcr.io/open-webui/open-webui:main
+    rm -rf /var/www/open-webui
+    docker cp temp-webui:/app/build /var/www/open-webui
+    docker rm -f temp-webui
+    docker system prune -a --volumes -f >/dev/null 2>&1 || true
+    systemctl stop docker docker.socket && systemctl disable docker docker.socket
+fi
+
+# 2. Автоматическое определение основного домена из конфига Nginx
+MAIN_DOMAIN=$(python3 - << 'PY'
+import glob, re, os
+candidates = glob.glob('/etc/nginx/conf.d/*.conf') + glob.glob('/etc/nginx/sites-enabled/*')
+domains = []
+for p in candidates:
+    if os.path.isfile(p):
+        t = open(p, errors='ignore').read()
+        if 'ssl_certificate' in t:
+            for m in re.finditer(r'server_name\s+([^;]+);', t):
+                d = m.group(1).strip().split()[0]
+                if d not in ['_', 'localhost', '""', "''"]:
+                    domains.append(d)
+print(sorted(domains, key=lambda x: (x.count('.'), len(x)))[0] if domains else "local.host")
+PY
+)
+
+ADMIN_EMAIL="admin@${MAIN_DOMAIN}"
+if [ -f /root/webui_credentials.txt ] && grep -q "Пароль" /root/webui_credentials.txt; then
+    ADMIN_PASS=$(grep "Пароль" /root/webui_credentials.txt | awk '{print $NF}')
+else
+    ADMIN_PASS=$(openssl rand -base64 12 | tr -dc 'a-zA-Z0-9' | head -c 10)
+fi
+TOKEN_SECRET=$(openssl rand -hex 24)
+
+# 3. Конфигурация авторизации
+mkdir -p /opt/webui-core
+cat << JSON > /opt/webui-core/config.json
+{
+  "admin_email": "${ADMIN_EMAIL}",
+  "admin_pass": "${ADMIN_PASS}",
+  "valid_token": "jwt_${TOKEN_SECRET}"
+}
+JSON
+
+# 4. Создание микро-сервера WebUI-Core (Python + SQLite)
+cat << 'PYSRV' > /opt/webui-core/server.py
+#!/usr/bin/env python3
+import http.server, socketserver, json, sqlite3, os, time, urllib.parse, subprocess, random, uuid
+
+PORT = 3080
+DB_PATH = "/opt/webui-core/storage.db"
+
+with open("/opt/webui-core/config.json", "r", encoding="utf-8") as f:
+    CFG = json.load(f)
+
+ADMIN_EMAIL = CFG["admin_email"]
+ADMIN_PASS = CFG["admin_pass"]
+VALID_TOKEN = CFG["valid_token"]
+
+USER_OBJ = {
+    "id": "00000000-0000-0000-0000-000000000001",
+    "email": ADMIN_EMAIL,
+    "name": "Administrator",
+    "role": "admin",
+    "profile_image_url": "/favicon.png",
+    "token": VALID_TOKEN,
+    "token_type": "Bearer",
+    "permissions": {
+        "workspace": {"models": True, "knowledge": True, "prompts": True, "tools": True},
+        "chat": {"controls": True, "file_upload": True, "delete": True, "edit": True, "temporary": True}
+    }
+}
+
+CHATS_MEM = {}
+
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("CREATE TABLE IF NOT EXISTS auth_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, domain TEXT, ip TEXT, user TEXT, status TEXT)")
+    c.execute("CREATE TABLE IF NOT EXISTS chat_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, sender TEXT, text TEXT)")
+    c.execute("CREATE TABLE IF NOT EXISTS cluster_nodes (id INTEGER PRIMARY KEY AUTOINCREMENT, node_name TEXT, role TEXT, status TEXT, connections INT)")
+    c.execute("SELECT COUNT(*) FROM cluster_nodes")
+    if c.fetchone()[0] == 0:
+        c.execute("INSERT INTO cluster_nodes (node_name, role, status, connections) VALUES ('db-master-01', 'Primary RW (PostgreSQL 16)', 'ONLINE', 18)")
+        c.execute("INSERT INTO cluster_nodes (node_name, role, status, connections) VALUES ('db-replica-02', 'Hot Standby RO', 'ONLINE', 9)")
+        c.execute("INSERT INTO cluster_nodes (node_name, role, status, connections) VALUES ('redis-cache-01', 'In-Memory Cache', 'ONLINE', 42)")
+        c.execute("INSERT INTO chat_messages (ts, sender, text) VALUES (datetime('now'), 'System Bot', 'Workspace initialized. Security monitoring active.')")
+    conn.commit()
+    conn.close()
+
+def get_sys_stats():
+    try:
+        uptime = subprocess.check_output("uptime -p", shell=True).decode().strip()
+        mem = subprocess.check_output("free -m | awk '/^Mem:/{printf \"%s / %s MB\", $3, $2}'", shell=True).decode().strip()
+        disk = subprocess.check_output("df -h / | awk 'NR==2{printf \"%s / %s (%s)\", $3, $2, $5}'", shell=True).decode().strip()
+        load = os.getloadavg()
+        return {"uptime": uptime, "ram": mem, "disk": disk, "load": f"{load[0]:.2f}, {load[1]:.2f}, {load[2]:.2f}"}
+    except Exception:
+        return {"uptime": "up", "ram": "N/A", "disk": "N/A", "load": "0.01"}
+
+class ThreadingHTTPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, format, *args): pass
+
+    def send_json(self, code, data, extra_headers=None):
+        body = json.dumps(data).encode('utf-8')
+        self.send_response(code)
+        self.send_header('Content-Type', 'application/json; charset=utf-8')
+        self.send_header('Content-Length', str(len(body)))
+        self.send_header('Cache-Control', 'no-store')
+        if extra_headers:
+            for k, v in extra_headers.items():
+                self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def is_authed(self):
+        auth = self.headers.get('Authorization', '')
+        cookie = self.headers.get('Cookie', '')
+        return (VALID_TOKEN in auth) or (VALID_TOKEN in cookie)
+
+    def read_body(self):
+        length = int(self.headers.get('Content-Length', 0))
+        if length > 0:
+            try: return json.loads(self.rfile.read(length).decode('utf-8'))
+            except: return {}
+        return {}
+
+    def do_GET(self):
+        p = urllib.parse.urlparse(self.path).path
+
+        if p == '/api/config':
+            return self.send_json(200, {
+                "status": True, "name": "Open WebUI", "version": "0.5.20", "default_locale": "en-US",
+                "oauth": {"providers": {}},
+                "features": {
+                    "auth": True, "auth_trusted_header": False, "enable_ldap": False, "enable_api_key": True,
+                    "enable_signup": False, "enable_login_form": True, "enable_websocket": False,
+                    "enable_direct_connections": False, "enable_channels": False, "enable_message_rating": True
+                },
+                "default_models": "deepseek-r1:32b",
+                "default_prompt_suggestions": [
+                    {"title": ["Server Status", "Check VPS RAM & CPU"], "content": "Show server status"},
+                    {"title": ["Security Logs", "Recent login attempts"], "content": "Show recent auth logs"}
+                ]
+            })
+        if p == '/api/version': return self.send_json(200, {"version": "0.5.20"})
+        if p == '/api/changelog': return self.send_json(200, {"0.5.20": {"date": "2025-02-01", "content": "Active"}})
+
+        if p in ['/api/v1/auths/', '/api/v1/auths', '/api/v1/users/user']:
+            if self.is_authed(): return self.send_json(200, USER_OBJ)
+            return self.send_json(401, {"detail": "Not authenticated"})
+
+        if p in ['/api/models', '/ollama/api/tags', '/api/v1/models', '/api/v1/models/']:
+            if not self.is_authed(): return self.send_json(401, {"detail": "Not authenticated"})
+            return self.send_json(200, {"data": [
+                {"id": "deepseek-r1:32b", "name": "DeepSeek-R1:32B (Local Node)", "object": "model", "created": 1730000000, "owned_by": "ollama", "info": {"meta": {"profile_image_url": "/favicon.png", "capabilities": {"vision": False}}}},
+                {"id": "llama3.3:70b", "name": "Llama-3.3-70B-Instruct", "object": "model", "created": 1730000000, "owned_by": "ollama", "info": {"meta": {"profile_image_url": "/favicon.png", "capabilities": {"vision": False}}}},
+                {"id": "qwen2.5-coder:32b", "name": "Qwen2.5-Coder:32B", "object": "model", "created": 1730000000, "owned_by": "ollama", "info": {"meta": {"profile_image_url": "/favicon.png", "capabilities": {"vision": False}}}}
+            ]})
+
+        if p.startswith('/api/v1/users/user/settings'):
+            return self.send_json(200, {"ui": {"theme": "dark"}})
+
+        if p.startswith('/api/v1/chats/') and len(p.split('/')) == 5:
+            cid = p.split('/')[-1]
+            if cid in CHATS_MEM: return self.send_json(200, CHATS_MEM[cid])
+
+        if p == '/api/sub/dashboard':
+            if not self.is_authed(): return self.send_json(401, {"error": "Unauthorized"})
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            c.execute("SELECT id, ts, domain, ip, user, status FROM auth_logs ORDER BY id DESC LIMIT 15")
+            logs = [{"id": r[0], "ts": r[1], "domain": r[2], "ip": r[3], "user": r[4], "status": r[5]} for r in c.fetchall()]
+            c.execute("SELECT id, ts, sender, text FROM chat_messages ORDER BY id DESC LIMIT 20")
+            msgs = [{"id": r[0], "ts": r[1], "sender": r[2], "text": r[3]} for r in reversed(c.fetchall())]
+            c.execute("SELECT id, node_name, role, status, connections FROM cluster_nodes")
+            nodes = [{"id": r[0], "name": r[1], "role": r[2], "status": r[3], "conns": r[4]} for r in c.fetchall()]
+            conn.close()
+            return self.send_json(200, {"stats": get_sys_stats(), "logs": logs, "messages": msgs, "nodes": nodes})
+
+        if p.startswith('/api/'):
+            return self.send_json(200 if self.is_authed() else 401, [] if self.is_authed() else {"detail": "Not authenticated"})
+        self.send_json(404, {"detail": "Not found"})
+
+    def do_POST(self):
+        p = urllib.parse.urlparse(self.path).path
+        data = self.read_body()
+        ip = self.headers.get('X-Real-IP', self.client_address[0])
+        host = self.headers.get('Host', 'unknown')
+
+        if p in ['/api/v1/auths/signin', '/api/sub/login']:
+            user = str(data.get('email') or data.get('user') or '').strip()
+            pw = str(data.get('password') or '').strip()
+            ok = (pw == ADMIN_PASS and len(user) > 0)
+            conn = sqlite3.connect(DB_PATH)
+            conn.execute("INSERT INTO auth_logs (ts, domain, ip, user, status) VALUES (datetime('now'), ?, ?, ?, ?)",
+                         (host, ip, user, 'SUCCESS' if ok else 'FAILED'))
+            if not ok:
+                conn.execute("INSERT INTO chat_messages (ts, sender, text) VALUES (datetime('now'), 'Security Bot', ?)",
+                             (f"⚠️ Failed login on {host} from IP {ip} (user: {user})",))
+            conn.commit()
+            conn.close()
+            if ok:
+                cookie = f"token={VALID_TOKEN}; Path=/; HttpOnly; SameSite=Lax"
+                return self.send_json(200, USER_OBJ, extra_headers={"Set-Cookie": cookie})
+            return self.send_json(400, {"detail": "The email or password provided is incorrect."})
+
+        if p == '/api/v1/auths/signout':
+            return self.send_json(200, {"status": True}, extra_headers={"Set-Cookie": "token=; Path=/; Max-Age=0"})
+
+        if p == '/api/v1/chats/new':
+            cid = str(uuid.uuid4())
+            obj = {"id": cid, "title": "Server Diagnostics", "chat": data.get("chat", {}), "updated_at": int(time.time()), "created_at": int(time.time())}
+            CHATS_MEM[cid] = obj
+            return self.send_json(200, obj)
+
+        if p.startswith('/api/v1/chats/') and len(p.split('/')) == 5:
+            cid = p.split('/')[-1]
+            obj = {"id": cid, "title": "Server Diagnostics", "chat": data.get("chat", {}), "updated_at": int(time.time()), "created_at": int(time.time())}
+            CHATS_MEM[cid] = obj
+            return self.send_json(200, obj)
+
+        if p in ['/api/chat/completions', '/ollama/api/chat']:
+            if not self.is_authed(): return self.send_json(401, {"detail": "Unauthorized"})
+            st = get_sys_stats()
+            reply = (
+                f"🟢 **Node Status ({host})**\n"
+                f"- **RAM Usage:** {st['ram']}\n"
+                f"- **Disk Space:** {st['disk']}\n"
+                f"- **CPU Load:** {st['load']}\n"
+                f"- **Uptime:** {st['uptime']}\n\n"
+                f"*Lightweight WebUI-Core engine is active (~15 MB RAM).*"
+            )
+            if data.get("stream", False):
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/event-stream; charset=utf-8')
+                self.send_header('Cache-Control', 'no-cache')
+                self.end_headers()
+                chunk = {"id": "chatcmpl-1", "object": "chat.completion.chunk", "created": int(time.time()), "model": data.get("model", "deepseek-r1:32b"), "choices": [{"index": 0, "delta": {"role": "assistant", "content": reply}, "finish_reason": None}]}
+                done_chunk = {"id": "chatcmpl-1", "object": "chat.completion.chunk", "created": int(time.time()), "model": data.get("model", "deepseek-r1:32b"), "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+                self.wfile.write(f"data: {json.dumps(chunk)}\n\ndata: {json.dumps(done_chunk)}\n\ndata: [DONE]\n\n".encode('utf-8'))
+                return
+            return self.send_json(200, {
+                "id": "chatcmpl-1", "object": "chat.completion", "created": int(time.time()),
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": reply}, "finish_reason": "stop"}]
+            })
+
+        if p == '/api/sub/sql':
+            if not self.is_authed(): return self.send_json(401, {"error": "Unauthorized"})
+            q = str(data.get('query', 'SELECT * FROM cluster_nodes;'))
+            conn = sqlite3.connect(DB_PATH)
+            try:
+                cur = conn.cursor()
+                cur.execute(q)
+                cols = [d[0] for d in cur.description] if cur.description else []
+                rows = cur.fetchall()
+                conn.commit()
+                conn.close()
+                return self.send_json(200, {"columns": cols, "rows": rows})
+            except Exception as e:
+                conn.close()
+                return self.send_json(400, {"error": str(e)})
+
+        if p == '/api/sub/chat':
+            if not self.is_authed(): return self.send_json(401, {"error": "Unauthorized"})
+            txt = str(data.get('text', '')).strip()
+            if txt:
+                conn = sqlite3.connect(DB_PATH)
+                conn.execute("INSERT INTO chat_messages (ts, sender, text) VALUES (datetime('now'), 'Admin', ?)", (txt,))
+                conn.commit()
+                conn.close()
+            return self.send_json(200, {"status": "ok"})
+
+        if p == '/api/sub/db_node':
+            if not self.is_authed(): return self.send_json(401, {"error": "Unauthorized"})
+            act = data.get('action')
+            conn = sqlite3.connect(DB_PATH)
+            if act == 'toggle':
+                nid = int(data.get('id', 0))
+                conn.execute("UPDATE cluster_nodes SET status = CASE WHEN status='ONLINE' THEN 'MAINTENANCE' ELSE 'ONLINE' END, connections = CASE WHEN status='ONLINE' THEN 0 ELSE ? END WHERE id = ?", (random.randint(5, 35), nid))
+            elif act == 'flush':
+                conn.execute("UPDATE cluster_nodes SET connections = 1 WHERE status='ONLINE'")
+            elif act == 'add':
+                name = str(data.get('name', f'db-replica-0{random.randint(3,9)}')).strip()
+                role = str(data.get('role', 'Hot Standby RO')).strip()
+                conn.execute("INSERT INTO cluster_nodes (node_name, role, status, connections) VALUES (?, ?, 'ONLINE', ?)", (name, role, random.randint(4, 15)))
+            elif act == 'delete':
+                nid = int(data.get('id', 0))
+                conn.execute("DELETE FROM cluster_nodes WHERE id = ? AND id > 1", (nid,))
+            conn.commit()
+            conn.close()
+            return self.send_json(200, {"status": "ok"})
+
+        return self.send_json(200, data if isinstance(data, dict) else {"status": True})
+
+    def do_DELETE(self):
+        return self.send_json(200, True)
+
+if __name__ == '__main__':
+    init_db()
+    with ThreadingHTTPServer(("127.0.0.1", PORT), Handler) as httpd:
+        httpd.serve_forever()
+PYSRV
+chmod +x /opt/webui-core/server.py
+
+# 5. Настройка systemd-службы с лимитом памяти (MemoryMax=45M)
+cat << 'SVC' > /etc/systemd/system/webui-core.service
+[Unit]
+Description=Ultra-Lightweight WebUI Interactive Backend
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/webui-core/server.py
+Restart=always
+RestartSec=2
+MemoryMax=45M
+
+[Install]
+WantedBy=multi-user.target
+SVC
+
+systemctl daemon-reload
+systemctl enable webui-core.service
+systemctl restart webui-core.service
+
+# 6. Автоматическая генерация субдоменов и пересборка конфига Nginx
+python3 - << 'PYEOF'
+import os, re, glob
+
+candidates = glob.glob('/etc/nginx/conf.d/*.conf') + glob.glob('/etc/nginx/sites-enabled/*')
+target_conf = None
+for path in candidates:
+    if os.path.isfile(path):
+        content = open(path, 'r', encoding='utf-8', errors='ignore').read()
+        if 'ssl_certificate' in content and 'server_name' in content:
+            target_conf = path
+            break
+
+if not target_conf:
+    print("❌ Не найден конфиг Nginx!")
+    exit(1)
+
+raw_text = open(target_conf, 'r', encoding='utf-8', errors='ignore').read()
+chunks = re.split(r'(?=^server\s*\{)', raw_text, flags=re.MULTILINE)
+
+domains = []
+for ch in chunks:
+    m = re.search(r'server_name\s+([^;]+);', ch)
+    if m:
+        d = m.group(1).strip().split()[0]
+        if d not in ['_', 'localhost', '""', "''"]:
+            domains.append(d)
+
+main_domain = sorted(domains, key=lambda x: (x.count('.'), len(x)))[0]
+
+def build_subdomain_html(full_domain):
+    sub = full_domain.split('.')[0].lower()
+    mode, title = "portal", f"{sub.upper()} Console — {full_domain}"
+    if any(k in sub for k in ['sql', 'mysql', 'pma', 'adminer']):
+        mode, title = "sql", f"Adminer 4.8.1 SQL — {full_domain}"
+    elif any(k in sub for k in ['database', 'db', 'pg', 'postgres', 'mongo', 'redis']):
+        mode, title = "db", f"DB Cluster Manager — {full_domain}"
+    elif any(k in sub for k in ['chat', 'msg', 'im', 'meet', 'matrix', 'mattermost']):
+        mode, title = "chat", f"TeamChat Workspace — {full_domain}"
+
+    return f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>{title}</title>
+<style>
+*{{box-sizing:border-box}}body{{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0b0f19;color:#e2e8f0;min-height:100vh;display:flex;align-items:center;justify-content:center}}
+.card{{background:#151c2c;border:1px solid #26324d;border-radius:10px;width:400px;padding:32px;box-shadow:0 20px 40px rgba(0,0,0,.6)}}
+.tag{{display:inline-block;background:#1e3a8a;color:#93c5fd;font-size:11px;font-weight:700;padding:3px 8px;border-radius:4px;margin-bottom:10px}}
+h2{{margin:0 0 6px;font-size:20px}}p{{margin:0 0 20px;color:#94a3b8;font-size:13px}}
+label{{display:block;font-size:12px;color:#94a3b8;margin-bottom:5px}}
+input,textarea,select{{width:100%;padding:10px 12px;margin-bottom:14px;background:#0b0f19;border:1px solid #334155;color:#fff;border-radius:6px;font-size:13px}}
+button{{width:100%;padding:11px;background:#2563eb;color:#fff;border:none;border-radius:6px;font-weight:600;cursor:pointer;font-size:13px}}
+button:hover{{background:#1d4ed8}}
+.btn-sm{{width:auto;padding:5px 10px;font-size:12px;margin-right:6px}}
+.err{{display:none;background:#450a0a;border:1px solid #ef4444;color:#fca5a5;padding:10px;border-radius:6px;font-size:12px;margin-bottom:14px;font-family:monospace}}
+#app{{display:none;width:100%;max-width:980px;padding:24px}}
+.top{{display:flex;justify-content:space-between;align-items:center;background:#151c2c;padding:16px 22px;border-radius:10px;border:1px solid #26324d;margin-bottom:20px}}
+.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:14px;margin-bottom:20px}}
+.stat{{background:#151c2c;border:1px solid #26324d;padding:16px;border-radius:8px}}
+.stat span{{font-size:12px;color:#94a3b8;display:block;margin-bottom:6px}}.stat b{{font-size:17px;color:#38bdf8;font-family:monospace}}
+.panel{{background:#151c2c;border:1px solid #26324d;padding:20px;border-radius:10px;margin-bottom:20px}}
+table{{width:100%;border-collapse:collapse;font-size:13px;font-family:monospace}}
+th,td{{border-bottom:1px solid #26324d;padding:10px 8px;text-align:left}}th{{color:#94a3b8}}
+.msg-box{{max-height:260px;overflow-y:auto;background:#0b0f19;padding:12px;border-radius:6px;border:1px solid #26324d;margin-bottom:12px}}
+.msg{{margin-bottom:8px;font-size:13px}}.msg b{{color:#60a5fa}}
+</style></head><body data-mode="{mode}">
+
+<div class="card" id="login-box">
+    <span class="tag">{mode.upper()} SERVICE NODE</span>
+    <h2>{full_domain}</h2>
+    <p>Authenticate to access interactive console</p>
+    <div id="err" class="err"></div>
+    <form onsubmit="doLogin(event)">
+        <label>Username / Email</label>
+        <input type="text" id="u" placeholder="admin@{main_domain} or admin" required>
+        <label>Password</label>
+        <input type="password" id="p" placeholder="••••••••••••" required>
+        <button type="submit" id="btn">Sign In</button>
+    </form>
+</div>
+
+<div id="app">
+    <div class="top">
+        <div><strong>🟢 {title}</strong> <span style="color:#64748b;font-size:13px;margin-left:10px">Interactive Session</span></div>
+        <button style="width:auto;padding:7px 14px;background:#334155" onclick="logout()">Disconnect</button>
+    </div>
+
+    <div class="grid" id="stats-grid"></div>
+
+    <div class="panel" id="db-panel" style="display:none">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
+            <h3 style="margin:0">Database Cluster Nodes (Replication Topology)</h3>
+            <button class="btn-sm" style="background:#0ea5e9" onclick="dbAction('flush')">🔄 Flush Connection Pools</button>
+        </div>
+        <div style="overflow-x:auto;margin-bottom:16px"><table id="db-nodes-table"></table></div>
+        <form onsubmit="addNode(event)" style="display:flex;gap:10px;align-items:center">
+            <input type="text" id="node-name" placeholder="New node name (e.g. db-replica-03)" required style="margin:0">
+            <select id="node-role" style="margin:0;width:260px">
+                <option>Hot Standby RO (PostgreSQL)</option>
+                <option>Analytics Node (ClickHouse)</option>
+                <option>In-Memory Shard (Redis)</option>
+            </select>
+            <button type="submit" style="width:200px;background:#10b981">+ Add Replica Node</button>
+        </form>
+    </div>
+
+    <div class="panel" id="sql-panel" style="display:none">
+        <h3 style="margin-top:0">SQL Query Console (SQLite Engine)</h3>
+        <textarea id="sql-q" rows="2">SELECT * FROM cluster_nodes;</textarea>
+        <button onclick="runSql()" style="width:auto;padding:8px 18px;margin-bottom:14px">Execute SQL</button>
+        <div style="overflow-x:auto"><table id="sql-res"></table></div>
+    </div>
+
+    <div class="panel" id="chat-panel" style="display:none">
+        <h3 style="margin-top:0">Encrypted Workspace Channel (#security-ops)</h3>
+        <div class="msg-box" id="chat-list"></div>
+        <form onsubmit="sendChat(event)" style="display:flex;gap:10px">
+            <input type="text" id="chat-in" placeholder="Write a message to workspace..." style="margin:0">
+            <button type="submit" style="width:140px">Send</button>
+        </form>
+    </div>
+
+    <div class="panel">
+        <h3 style="margin-top:0">Recent Security & Auth Audit Logs</h3>
+        <div style="overflow-x:auto"><table id="log-table"></table></div>
+    </div>
+</div>
+
+<script>
+const mode = document.body.dataset.mode;
+let token = localStorage.getItem('sub_jwt') || '';
+if(token) loadDashboard();
+
+async function doLogin(e){{
+    e.preventDefault();
+    const btn = document.getElementById('btn'), err = document.getElementById('err');
+    btn.innerText = 'Verifying...'; err.style.display = 'none';
+    const r = await fetch('/api/sub/login', {{
+        method:'POST', headers:{{'Content-Type':'application/json'}},
+        body: JSON.stringify({{user:document.getElementById('u').value, password:document.getElementById('p').value}})
+    }});
+    const d = await r.json();
+    btn.innerText = 'Sign In';
+    if(r.ok && d.token){{
+        token = d.token; localStorage.setItem('sub_jwt', token); loadDashboard();
+    }} else {{
+        err.innerText = mode==='sql' ? 'SQLSTATE[HY000] [1045] Access denied for user' : (mode==='db' ? 'FATAL: password authentication failed for cluster role' : (d.detail || 'Authentication failed'));
+        err.style.display = 'block';
+    }}
+}}
+
+async function loadDashboard(){{
+    const r = await fetch('/api/sub/dashboard', {{headers:{{'Authorization':'Bearer '+token}}}});
+    if(!r.ok){{ localStorage.removeItem('sub_jwt'); return; }}
+    const d = await r.json();
+    document.getElementById('login-box').style.display = 'none';
+    document.getElementById('app').style.display = 'block';
+    document.getElementById('stats-grid').innerHTML = `
+        <div class="stat"><span>RAM Usage</span><b>${{d.stats.ram}}</b></div>
+        <div class="stat"><span>CPU Load Avg</span><b>${{d.stats.load}}</b></div>
+        <div class="stat"><span>Disk Storage</span><b>${{d.stats.disk}}</b></div>
+        <div class="stat"><span>Node Uptime</span><b>${{d.stats.uptime}}</b></div>
+    `;
+    if(mode==='db'){{
+        document.getElementById('db-panel').style.display='block';
+        document.getElementById('db-nodes-table').innerHTML = '<tr><th>ID</th><th>Node Host</th><th>Replication Role</th><th>Status</th><th>Active Conns</th><th>Actions</th></tr>' +
+            d.nodes.map(n=>`<tr>
+                <td>#${{n.id}}</td><td><b>${{n.name}}</b></td><td>${{n.role}}</td>
+                <td><span style="color:${{n.status==='ONLINE'?'#4ade80':'#f59e0b'}}">● ${{n.status}}</span></td>
+                <td>${{n.conns}} / 100</td>
+                <td>
+                    <button class="btn-sm" style="background:#475569" onclick="dbAction('toggle', ${{n.id}})">${{n.status==='ONLINE'?'Pause Node':'Resume Node'}}</button>
+                    ${{n.id>1 ? `<button class="btn-sm" style="background:#991b1b" onclick="dbAction('delete', ${{n.id}})">Drop</button>` : ''}}
+                </td>
+            </tr>`).join('');
+    }}
+    if(mode==='sql'){{ document.getElementById('sql-panel').style.display='block'; runSql(); }}
+    if(mode==='chat'){{
+        document.getElementById('chat-panel').style.display='block';
+        document.getElementById('chat-list').innerHTML = d.messages.map(m=>`<div class="msg">[${{m.ts}}] <b>${{m.sender}}:</b> ${{m.text}}</div>`).join('');
+    }}
+    document.getElementById('log-table').innerHTML = '<tr><th>Time</th><th>Host</th><th>IP</th><th>User</th><th>Status</th></tr>' +
+        d.logs.map(l=>`<tr><td>${{l.ts}}</td><td>${{l.domain}}</td><td>${{l.ip}}</td><td>${{l.user}}</td><td style="color:${{l.status==='SUCCESS'?'#4ade80':'#f87171'}}">${{l.status}}</td></tr>`).join('');
+}}
+
+async function dbAction(action, id=0){{
+    await fetch('/api/sub/db_node', {{method:'POST', headers:{{'Content-Type':'application/json','Authorization':'Bearer '+token}}, body:JSON.stringify({{action, id}})}});
+    loadDashboard();
+}}
+
+async function addNode(e){{
+    e.preventDefault();
+    const name = document.getElementById('node-name').value;
+    const role = document.getElementById('node-role').value;
+    await fetch('/api/sub/db_node', {{method:'POST', headers:{{'Content-Type':'application/json','Authorization':'Bearer '+token}}, body:JSON.stringify({{action:'add', name, role}})}});
+    document.getElementById('node-name').value = '';
+    loadDashboard();
+}}
+
+async function runSql(){{
+    const q = document.getElementById('sql-q').value;
+    const r = await fetch('/api/sub/sql', {{method:'POST', headers:{{'Content-Type':'application/json','Authorization':'Bearer '+token}}, body:JSON.stringify({{query:q}})}});
+    const d = await r.json();
+    const tbl = document.getElementById('sql-res');
+    if(d.error){{ tbl.innerHTML = `<tr><td style="color:#f87171">${{d.error}}</td></tr>`; return; }}
+    tbl.innerHTML = '<tr>'+(d.columns||[]).map(c=>`<th>${{c}}</th>`).join('')+'</tr>' +
+        (d.rows||[]).map(row=>'<tr>'+row.map(v=>`<td>${{v}}</td>`).join('')+'</tr>').join('');
+}}
+
+async function sendChat(e){{
+    e.preventDefault();
+    const inp = document.getElementById('chat-in');
+    if(!inp.value) return;
+    await fetch('/api/sub/chat', {{method:'POST', headers:{{'Content-Type':'application/json','Authorization':'Bearer '+token}}, body:JSON.stringify({{text:inp.value}})}});
+    inp.value = ''; loadDashboard();
+}}
+
+function logout(){{ localStorage.removeItem('sub_jwt'); location.reload(); }}
+</script></body></html>"""
+
+rebuilt_servers = []
+
+for ch in chunks:
+    if not ch.strip().startswith('server'):
+        continue
+
+    m_name = re.search(r'server_name\s+([^;]+);', ch)
+    domain = m_name.group(1).strip().split()[0] if m_name else "_"
+
+    if domain in ['_', 'localhost', '""', "''"]:
+        rebuilt_servers.append(ch.strip())
+        continue
+
+    header_lines = []
+    for line in ch.splitlines():
+        s = line.strip()
+        if any(s.startswith(k) for k in ['listen ', 'server_name ', 'server_tokens ', 'ssl_']) and s.endswith(';'):
+            header_lines.append("    " + s)
+
+    custom_locations = []
+    for m_loc in re.finditer(r'location\s+\^~\s+/(?!api/|ollama/)([A-Za-z0-9_-]+)/\s*\{([^}]*)\}', ch):
+        custom_locations.append(f"    location ^~ /{m_loc.group(1)}/ {{{m_loc.group(2)}}}")
+
+    srv = ["server {"] + header_lines + custom_locations
+
+    if domain == main_domain:
+        srv.append("""    location ^~ /api/ {
+        proxy_pass http://127.0.0.1:3080;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_buffering off;
+    }
+    location ^~ /ollama/ {
+        proxy_pass http://127.0.0.1:3080;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+    location / {
+        root /var/www/open-webui;
+        index index.html;
+        try_files $uri $uri/ /index.html;
+    }""")
+        print(f"   ✅ Основной домен [{domain}] -> подключен Open WebUI")
+    else:
+        sub_prefix = re.sub(r'[^a-zA-Z0-9_-]', '_', domain.split('.')[0].lower())
+        target_dir = f"/var/www/webui_{sub_prefix}"
+        os.makedirs(target_dir, exist_ok=True)
+        with open(os.path.join(target_dir, "index.html"), "w", encoding="utf-8") as wf:
+            wf.write(build_subdomain_html(domain))
+        srv.append(f"""    location ^~ /api/sub/ {{
+        proxy_pass http://127.0.0.1:3080;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }}
+    location / {{
+        root {target_dir};
+        index index.html;
+        add_header Cache-Control "no-store, no-cache, must-revalidate";
+    }}""")
+        print(f"   ✅ Субдомен [{domain}] -> подключена интерактивная панель ({target_dir})")
+
+    srv.append("}")
+    rebuilt_servers.append("\n".join(srv))
+
+final_nginx_conf = "\n\n".join(rebuilt_servers) + "\n"
+with open(target_conf, 'w', encoding='utf-8') as f:
+    f.write(final_nginx_conf)
+PYEOF
+
+chown -R www-data:www-data /var/www/open-webui /var/www/webui_* 2>/dev/null || true
+nginx -t && systemctl reload nginx
+
+sleep 1
+HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST http://127.0.0.1:3080/api/v1/auths/signin \
+  -H "Content-Type: application/json" \
+  -d "{\"email\":\"${ADMIN_EMAIL}\",\"password\":\"${ADMIN_PASS}\"}")
+
+cat << CRED > /root/webui_credentials.txt
+Основной домен (Open WebUI): https://${MAIN_DOMAIN}
+Логин (Email): ${ADMIN_EMAIL}
+Пароль (для всех сайтов и субдоменов): ${ADMIN_PASS}
+CRED
+
+echo "=================================================================="
+echo " 🎉 УСТАНОВКА ЗАВЕРШЕНА! Проверка входа: HTTP ${HTTP_CODE}"
+echo "=================================================================="
+echo " 🌐 Основной сайт (Open WebUI): https://${MAIN_DOMAIN}"
+echo " 👤 Логин (для всех сайтов):    ${ADMIN_EMAIL}"
+echo " 🔑 Пароль (для всех сайтов):   ${ADMIN_PASS}"
+echo " 📄 Сохранено в файл:           /root/webui_credentials.txt"
+echo "=================================================================="
