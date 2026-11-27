@@ -577,8 +577,17 @@ for ch in chunks:
     header_lines = []
     for line in ch.splitlines():
         s = line.strip()
-        if any(s.startswith(k) for k in ['listen ', 'server_name ', 'server_tokens ', 'ssl_']) and s.endswith(';'):
+        # ИСПРАВЛЕНИЕ: Добавлен 'http2 ' в список разрешенных директив
+        if any(s.startswith(k) for k in ['listen ', 'server_name ', 'server_tokens ', 'ssl_', 'http2 ']) and s.endswith(';'):
             header_lines.append("    " + s)
+
+    # ИСПРАВЛЕНИЕ: Защитная проверка. Если http2 потерялся, но мы знаем, что он нужен, добавляем принудительно
+    if not any('http2' in l for l in header_lines):
+        # Если Nginx >= 1.25.1 (в оригинальном скрипте определялось, мы просто добавим новую директиву, 
+        # если у вас старая версия, она будет проигнорирована или выдаст ошибку. 
+        # Но раз мы добавили 'http2 ' в startswith, если он был в listen, он сохранится.
+        # Эта строчка — страховка для новых версий Nginx.
+        header_lines.append("    http2 on;")
 
     custom_locations = []
     for m_loc in re.finditer(r'location\s+\^~\s+/(?!api/|ollama/)([A-Za-z0-9_-]+)/\s*\{([^}]*)\}', ch):
